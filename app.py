@@ -22,7 +22,7 @@ uploaded_t1 = st.file_uploader("Upload T1 Image", type=["jpg", "png"])
 uploaded_t2 = st.file_uploader("Upload T2 Image", type=["jpg", "png"])
 
 # ==========================================
-# IMAGE LOADER
+# LOAD IMAGE
 # ==========================================
 def load_image(uploaded_file):
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -63,54 +63,36 @@ def detect_vehicles(img):
     return boxes
 
 # ==========================================
-# IOU (for matching vehicles)
+# VEHICLE CHANGE (FIXED LIKE BUILDINGS)
 # ==========================================
-def iou(box1, box2):
-    x1, y1, x2, y2 = box1
-    x1g, y1g, x2g, y2g = box2
+def detect_vehicle_changes(img1, img2, boxes1, boxes2):
+    diff = cv2.absdiff(img1, img2)
+    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, change_mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
 
-    xi1 = max(x1, x1g)
-    yi1 = max(y1, y1g)
-    xi2 = min(x2, x2g)
-    yi2 = min(y2, y2g)
-
-    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-
-    box1_area = (x2 - x1) * (y2 - y1)
-    box2_area = (x2g - x1g) * (y2g - y1g)
-
-    union = box1_area + box2_area - inter_area
-
-    return inter_area / union if union > 0 else 0
-
-# ==========================================
-# VEHICLE CHANGE DETECTION
-# ==========================================
-def detect_vehicle_changes(boxes1, boxes2):
-    matched = set()
     new_vehicles = []
     removed_vehicles = []
 
-    # match T2 with T1
-    for i, b2 in enumerate(boxes2):
-        found = False
-        for j, b1 in enumerate(boxes1):
-            if iou(b1, b2) > 0.3:
-                matched.add(j)
-                found = True
-                break
-        if not found:
-            new_vehicles.append(b2)
+    # NEW vehicles (in T2)
+    for box in boxes2:
+        x1, y1, x2, y2 = map(int, box)
+        region = change_mask[y1:y2, x1:x2]
 
-    # vehicles in T1 not matched → removed
-    for j, b1 in enumerate(boxes1):
-        if j not in matched:
-            removed_vehicles.append(b1)
+        if region.size > 0 and np.sum(region) > 500:
+            new_vehicles.append(box)
+
+    # REMOVED vehicles (in T1)
+    for box in boxes1:
+        x1, y1, x2, y2 = map(int, box)
+        region = change_mask[y1:y2, x1:x2]
+
+        if region.size > 0 and np.sum(region) > 500:
+            removed_vehicles.append(box)
 
     return new_vehicles, removed_vehicles
 
 # ==========================================
-# BUILDING CHANGE DETECTION
+# BUILDING CHANGE
 # ==========================================
 def detect_changed_buildings(img1, img2):
     gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
@@ -172,26 +154,26 @@ def intelligence(b_changed, new_v, removed_v):
 def draw(img, vehicles, new_v, removed_v, buildings, changed_buildings):
     out = img.copy()
 
-    # normal vehicles (green)
+    # vehicles normal
     for box in vehicles:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
-    # new vehicles (yellow)
+    # new vehicles
     for box in new_v:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    # removed vehicles (purple)
+    # removed vehicles
     for box in removed_v:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), (255, 0, 255), 2)
 
-    # buildings (blue)
+    # buildings
     for (x, y, w, h) in buildings:
         cv2.rectangle(out, (x, y), (x+w, y+h), (255, 0, 0), 1)
 
-    # changed buildings (red)
+    # changed buildings
     for (x, y, w, h) in changed_buildings:
         cv2.rectangle(out, (x, y), (x+w, y+h), (0, 0, 255), 2)
 
@@ -211,7 +193,7 @@ if uploaded_t1 and uploaded_t2:
         boxes1 = detect_vehicles(img1)
         boxes2 = detect_vehicles(img2)
 
-        new_v, removed_v = detect_vehicle_changes(boxes1, boxes2)
+        new_v, removed_v = detect_vehicle_changes(img1, img2, boxes1, boxes2)
 
         # buildings
         b_total, b_changed, bb_all, bb_changed = detect_changed_buildings(img1, img2)
