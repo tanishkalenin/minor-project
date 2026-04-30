@@ -24,126 +24,95 @@ uploaded_t2 = st.file_uploader("Upload T2 Image", type=["jpg", "png"])
 # ==========================================
 # LOAD IMAGE
 # ==========================================
-def load_image(uploaded_file):
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    return cv2.imdecode(file_bytes, 1)
+def load_image(file):
+    bytes_data = np.asarray(bytearray(file.read()), dtype=np.uint8)
+    return cv2.imdecode(bytes_data, 1)
 
 # ==========================================
 # PREPROCESS
 # ==========================================
 def preprocess(img):
     img = cv2.resize(img, (640, 640))
-
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(2.0, (8, 8))
-    l = clahe.apply(l)
-
-    img = cv2.merge((l, a, b))
-    img = cv2.cvtColor(img, cv2.COLOR_LAB2BGR)
-
-    return img
+    l = cv2.createCLAHE(2.0,(8,8)).apply(l)
+    return cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_LAB2BGR)
 
 # ==========================================
-# VEHICLE DETECTION
+# CHANGE MASK
 # ==========================================
-def detect_vehicles(img):
-    results = model(img, conf=0.4, imgsz=320)
-    boxes = []
-
-    for r in results:
-        for b in r.boxes:
-            cls = int(b.cls[0])
-            label = r.names[cls]
-
-            if label in ["car", "bus", "truck"]:
-                boxes.append(b.xyxy[0].tolist())
-
-    return boxes
-
-# ==========================================
-# VEHICLE CHANGE (FIXED LIKE BUILDINGS)
-# ==========================================
-def detect_vehicle_changes(img1, img2, boxes1, boxes2):
+def get_change_mask(img1, img2):
     diff = cv2.absdiff(img1, img2)
     gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, change_mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+    _, mask = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
 
-    new_vehicles = []
-    removed_vehicles = []
+    # clean noise
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
 
-    # NEW vehicles (in T2)
-    for box in boxes2:
-        x1, y1, x2, y2 = map(int, box)
-        region = change_mask[y1:y2, x1:x2]
+    return mask
 
-        if region.size > 0 and np.sum(region) > 500:
-            new_vehicles.append(box)
+# ==========================================
+# VEHICLE CHANGE (ROBUST)
+# ==========================================
+def detect_vehicle_changes(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # REMOVED vehicles (in T1)
-    for box in boxes1:
-        x1, y1, x2, y2 = map(int, box)
-        region = change_mask[y1:y2, x1:x2]
+    new_v = []
+    removed_v = []
 
-        if region.size > 0 and np.sum(region) > 500:
-            removed_vehicles.append(box)
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        area = w*h
 
-    return new_vehicles, removed_vehicles
+        # vehicle-like size (tuneable)
+        if 50 < area < 1500:
+            new_v.append((x,y,w,h))
+
+        elif area < 50:
+            removed_v.append((x,y,w,h))
+
+    return new_v, removed_v
 
 # ==========================================
 # BUILDING CHANGE
 # ==========================================
-def detect_changed_buildings(img1, img2):
-    gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+def detect_buildings(img, mask):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     thresh = cv2.adaptiveThreshold(
-        gray, 255,
+        gray,255,
         cv2.ADAPTIVE_THRESH_MEAN_C,
         cv2.THRESH_BINARY_INV,
-        11, 2
+        11,2
     )
 
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours,_ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    diff = cv2.absdiff(img1, img2)
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, change_mask = cv2.threshold(diff_gray, 30, 255, cv2.THRESH_BINARY)
-
-    all_buildings = []
-    changed_buildings = []
+    changed = []
+    all_b = []
 
     for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
+        x,y,w,h = cv2.boundingRect(c)
+        area = w*h
 
-        if 100 < w * h < 5000:
-            all_buildings.append((x, y, w, h))
+        if 500 < area < 8000:
+            all_b.append((x,y,w,h))
 
-            region = change_mask[y:y+h, x:x+w]
+            region = mask[y:y+h, x:x+w]
+            if np.sum(region) > 800:
+                changed.append((x,y,w,h))
 
-            if np.sum(region) > 500:
-                changed_buildings.append((x, y, w, h))
-
-    return len(all_buildings), len(changed_buildings), all_buildings, changed_buildings
-
-# ==========================================
-# CHANGE MAP
-# ==========================================
-def pixel_change(img1, img2):
-    diff = cv2.absdiff(img1, img2)
-    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
-    return thresh
+    return all_b, changed
 
 # ==========================================
 # INTELLIGENCE
 # ==========================================
-def intelligence(b_changed, new_v, removed_v):
-    if b_changed > 5 or new_v > 5:
+def intelligence(b, nv, rv):
+    if b > 5 or nv > 5:
         return "HIGH"
-    elif new_v > 0 or removed_v > 0:
+    elif nv > 0 or rv > 0:
         return "MEDIUM"
     else:
         return "LOW"
@@ -151,31 +120,24 @@ def intelligence(b_changed, new_v, removed_v):
 # ==========================================
 # DRAW
 # ==========================================
-def draw(img, vehicles, new_v, removed_v, buildings, changed_buildings):
+def draw(img, buildings, changed_b, new_v, removed_v):
     out = img.copy()
 
-    # vehicles normal
-    for box in vehicles:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 1)
-
-    # new vehicles
-    for box in new_v:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-
-    # removed vehicles
-    for box in removed_v:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 0, 255), 2)
-
     # buildings
-    for (x, y, w, h) in buildings:
-        cv2.rectangle(out, (x, y), (x+w, y+h), (255, 0, 0), 1)
+    for x,y,w,h in buildings:
+        cv2.rectangle(out,(x,y),(x+w,y+h),(255,0,0),1)
 
     # changed buildings
-    for (x, y, w, h) in changed_buildings:
-        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 0, 255), 2)
+    for x,y,w,h in changed_b:
+        cv2.rectangle(out,(x,y),(x+w,y+h),(0,0,255),2)
+
+    # new vehicles
+    for x,y,w,h in new_v:
+        cv2.rectangle(out,(x,y),(x+w,y+h),(0,255,255),2)
+
+    # removed vehicles
+    for x,y,w,h in removed_v:
+        cv2.rectangle(out,(x,y),(x+w,y+h),(255,0,255),2)
 
     return out
 
@@ -189,50 +151,41 @@ if uploaded_t1 and uploaded_t2:
 
     if st.button("Run Analysis"):
 
-        # vehicles
-        boxes1 = detect_vehicles(img1)
-        boxes2 = detect_vehicles(img2)
-
-        new_v, removed_v = detect_vehicle_changes(img1, img2, boxes1, boxes2)
+        mask = get_change_mask(img1, img2)
 
         # buildings
-        b_total, b_changed, bb_all, bb_changed = detect_changed_buildings(img1, img2)
+        all_b, changed_b = detect_buildings(img2, mask)
 
-        # heatmap
-        heatmap = pixel_change(img1, img2)
+        # vehicles (robust)
+        new_v, removed_v = detect_vehicle_changes(mask)
 
         # intelligence
-        threat = intelligence(b_changed, len(new_v), len(removed_v))
+        threat = intelligence(len(changed_b), len(new_v), len(removed_v))
 
         # draw
-        out1 = draw(img1, boxes1, new_v, removed_v, bb_all, bb_changed)
-        out2 = draw(img2, boxes2, new_v, removed_v, bb_all, bb_changed)
+        out1 = draw(img1, all_b, changed_b, new_v, removed_v)
+        out2 = draw(img2, all_b, changed_b, new_v, removed_v)
 
         # DISPLAY
         st.subheader("Results")
 
-        col1, col2 = st.columns(2)
-        col1.image(out1, caption="T1")
-        col2.image(out2, caption="T2")
+        c1, c2 = st.columns(2)
+        c1.image(out1, caption="T1")
+        c2.image(out2, caption="T2")
 
-        st.image(heatmap, caption="Change Map")
+        st.image(mask, caption="Change Map")
 
-        st.metric("Changed Buildings", b_changed)
+        st.metric("Changed Buildings", len(changed_b))
         st.metric("New Vehicles", len(new_v))
         st.metric("Removed Vehicles", len(removed_v))
         st.metric("Threat Level", threat)
 
         # CSV
         df = pd.DataFrame([
-            {"metric": "changed_buildings", "value": b_changed},
-            {"metric": "new_vehicles", "value": len(new_v)},
-            {"metric": "removed_vehicles", "value": len(removed_v)},
-            {"metric": "threat_level", "value": threat}
+            {"metric":"changed_buildings","value":len(changed_b)},
+            {"metric":"new_vehicles","value":len(new_v)},
+            {"metric":"removed_vehicles","value":len(removed_v)},
+            {"metric":"threat","value":threat}
         ])
 
-        st.download_button(
-            "Download Results CSV",
-            df.to_csv(index=False),
-            "results.csv",
-            "text/csv"
-        )
+        st.download_button("Download CSV", df.to_csv(index=False), "results.csv")
