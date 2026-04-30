@@ -46,7 +46,7 @@ def preprocess(img):
     return img
 
 # ==========================================
-# VEHICLE DETECTION
+# VEHICLE DETECTION (YOLO)
 # ==========================================
 def detect_vehicles(img):
     results = model(img, conf=0.4, imgsz=320)
@@ -65,10 +65,10 @@ def detect_vehicles(img):
     return count, boxes
 
 # ==========================================
-# BUILDING DETECTION
+# BUILDING CHANGE DETECTION (FIXED)
 # ==========================================
-def detect_buildings(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def detect_changed_buildings(img1, img2):
+    gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
 
     thresh = cv2.adaptiveThreshold(
         gray, 255,
@@ -81,16 +81,29 @@ def detect_buildings(img):
         thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    buildings = []
+    # pixel change
+    diff = cv2.absdiff(img1, img2)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, change_mask = cv2.threshold(diff_gray, 30, 255, cv2.THRESH_BINARY)
+
+    all_buildings = []
+    changed_buildings = []
+
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
-        if 100 < w * h < 5000:
-            buildings.append((x, y, w, h))
 
-    return len(buildings), buildings
+        if 100 < w * h < 5000:
+            all_buildings.append((x, y, w, h))
+
+            region = change_mask[y:y+h, x:x+w]
+
+            if np.sum(region) > 500:
+                changed_buildings.append((x, y, w, h))
+
+    return len(all_buildings), len(changed_buildings), all_buildings, changed_buildings
 
 # ==========================================
-# CHANGE DETECTION
+# CHANGE MAP
 # ==========================================
 def pixel_change(img1, img2):
     diff = cv2.absdiff(img1, img2)
@@ -101,8 +114,8 @@ def pixel_change(img1, img2):
 # ==========================================
 # INTELLIGENCE
 # ==========================================
-def intelligence(b1, b2, v1, v2):
-    if b2 > b1:
+def intelligence(b_changed, v1, v2):
+    if b_changed > 5:
         return "HIGH"
     elif v2 > v1:
         return "MEDIUM"
@@ -110,17 +123,23 @@ def intelligence(b1, b2, v1, v2):
         return "LOW"
 
 # ==========================================
-# DRAW RESULTS
+# DRAW
 # ==========================================
-def draw(img, vehicles, buildings):
+def draw(img, vehicles, buildings, changed_buildings):
     out = img.copy()
 
+    # vehicles (green)
     for box in vehicles:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
+    # all buildings (blue)
     for (x, y, w, h) in buildings:
-        cv2.rectangle(out, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        cv2.rectangle(out, (x, y), (x+w, y+h), (255, 0, 0), 1)
+
+    # changed buildings (red)
+    for (x, y, w, h) in changed_buildings:
+        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 0, 255), 2)
 
     return out
 
@@ -137,17 +156,22 @@ if uploaded_t1 and uploaded_t2:
 
     if st.button("Run Analysis"):
 
+        # vehicles
         v1, vb1 = detect_vehicles(img1)
         v2, vb2 = detect_vehicles(img2)
 
-        b1, bb1 = detect_buildings(img1)
-        b2, bb2 = detect_buildings(img2)
+        # buildings (fixed)
+        b_total, b_changed, bb_all, bb_changed = detect_changed_buildings(img1, img2)
 
+        # heatmap
         heatmap = pixel_change(img1, img2)
-        threat = intelligence(b1, b2, v1, v2)
 
-        out1 = draw(img1, vb1, bb1)
-        out2 = draw(img2, vb2, bb2)
+        # intelligence
+        threat = intelligence(b_changed, v1, v2)
+
+        # draw
+        out1 = draw(img1, vb1, bb_all, bb_changed)
+        out2 = draw(img2, vb2, bb_all, bb_changed)
 
         # ==========================================
         # DISPLAY
@@ -160,7 +184,7 @@ if uploaded_t1 and uploaded_t2:
 
         st.image(heatmap, caption="Change Map")
 
-        st.metric("Buildings Change", b2 - b1)
+        st.metric("Changed Buildings", b_changed)
         st.metric("Vehicle Change", v2 - v1)
         st.metric("Threat Level", threat)
 
@@ -168,8 +192,11 @@ if uploaded_t1 and uploaded_t2:
         # CSV DOWNLOAD
         # ==========================================
         df = pd.DataFrame([
-            {"type": "building", "t1": b1, "t2": b2},
-            {"type": "vehicle", "t1": v1, "t2": v2}
+            {"metric": "total_buildings", "value": b_total},
+            {"metric": "changed_buildings", "value": b_changed},
+            {"metric": "vehicles_t1", "value": v1},
+            {"metric": "vehicles_t2", "value": v2},
+            {"metric": "threat_level", "value": threat}
         ])
 
         st.download_button(
