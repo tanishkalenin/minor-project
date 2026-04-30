@@ -46,11 +46,10 @@ def preprocess(img):
     return img
 
 # ==========================================
-# VEHICLE DETECTION (YOLO)
+# VEHICLE DETECTION
 # ==========================================
 def detect_vehicles(img):
     results = model(img, conf=0.4, imgsz=320)
-    count = 0
     boxes = []
 
     for r in results:
@@ -59,13 +58,59 @@ def detect_vehicles(img):
             label = r.names[cls]
 
             if label in ["car", "bus", "truck"]:
-                count += 1
                 boxes.append(b.xyxy[0].tolist())
 
-    return count, boxes
+    return boxes
 
 # ==========================================
-# BUILDING CHANGE DETECTION (FIXED)
+# IOU (for matching vehicles)
+# ==========================================
+def iou(box1, box2):
+    x1, y1, x2, y2 = box1
+    x1g, y1g, x2g, y2g = box2
+
+    xi1 = max(x1, x1g)
+    yi1 = max(y1, y1g)
+    xi2 = min(x2, x2g)
+    yi2 = min(y2, y2g)
+
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+
+    box1_area = (x2 - x1) * (y2 - y1)
+    box2_area = (x2g - x1g) * (y2g - y1g)
+
+    union = box1_area + box2_area - inter_area
+
+    return inter_area / union if union > 0 else 0
+
+# ==========================================
+# VEHICLE CHANGE DETECTION
+# ==========================================
+def detect_vehicle_changes(boxes1, boxes2):
+    matched = set()
+    new_vehicles = []
+    removed_vehicles = []
+
+    # match T2 with T1
+    for i, b2 in enumerate(boxes2):
+        found = False
+        for j, b1 in enumerate(boxes1):
+            if iou(b1, b2) > 0.3:
+                matched.add(j)
+                found = True
+                break
+        if not found:
+            new_vehicles.append(b2)
+
+    # vehicles in T1 not matched → removed
+    for j, b1 in enumerate(boxes1):
+        if j not in matched:
+            removed_vehicles.append(b1)
+
+    return new_vehicles, removed_vehicles
+
+# ==========================================
+# BUILDING CHANGE DETECTION
 # ==========================================
 def detect_changed_buildings(img1, img2):
     gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
@@ -81,7 +126,6 @@ def detect_changed_buildings(img1, img2):
         thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    # pixel change
     diff = cv2.absdiff(img1, img2)
     diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     _, change_mask = cv2.threshold(diff_gray, 30, 255, cv2.THRESH_BINARY)
@@ -114,10 +158,10 @@ def pixel_change(img1, img2):
 # ==========================================
 # INTELLIGENCE
 # ==========================================
-def intelligence(b_changed, v1, v2):
-    if b_changed > 5:
+def intelligence(b_changed, new_v, removed_v):
+    if b_changed > 5 or new_v > 5:
         return "HIGH"
-    elif v2 > v1:
+    elif new_v > 0 or removed_v > 0:
         return "MEDIUM"
     else:
         return "LOW"
@@ -125,15 +169,25 @@ def intelligence(b_changed, v1, v2):
 # ==========================================
 # DRAW
 # ==========================================
-def draw(img, vehicles, buildings, changed_buildings):
+def draw(img, vehicles, new_v, removed_v, buildings, changed_buildings):
     out = img.copy()
 
-    # vehicles (green)
+    # normal vehicles (green)
     for box in vehicles:
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
-    # all buildings (blue)
+    # new vehicles (yellow)
+    for box in new_v:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+    # removed vehicles (purple)
+    for box in removed_v:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 0, 255), 2)
+
+    # buildings (blue)
     for (x, y, w, h) in buildings:
         cv2.rectangle(out, (x, y), (x+w, y+h), (255, 0, 0), 1)
 
@@ -148,34 +202,31 @@ def draw(img, vehicles, buildings, changed_buildings):
 # ==========================================
 if uploaded_t1 and uploaded_t2:
 
-    img1 = load_image(uploaded_t1)
-    img2 = load_image(uploaded_t2)
-
-    img1 = preprocess(img1)
-    img2 = preprocess(img2)
+    img1 = preprocess(load_image(uploaded_t1))
+    img2 = preprocess(load_image(uploaded_t2))
 
     if st.button("Run Analysis"):
 
         # vehicles
-        v1, vb1 = detect_vehicles(img1)
-        v2, vb2 = detect_vehicles(img2)
+        boxes1 = detect_vehicles(img1)
+        boxes2 = detect_vehicles(img2)
 
-        # buildings (fixed)
+        new_v, removed_v = detect_vehicle_changes(boxes1, boxes2)
+
+        # buildings
         b_total, b_changed, bb_all, bb_changed = detect_changed_buildings(img1, img2)
 
         # heatmap
         heatmap = pixel_change(img1, img2)
 
         # intelligence
-        threat = intelligence(b_changed, v1, v2)
+        threat = intelligence(b_changed, len(new_v), len(removed_v))
 
         # draw
-        out1 = draw(img1, vb1, bb_all, bb_changed)
-        out2 = draw(img2, vb2, bb_all, bb_changed)
+        out1 = draw(img1, boxes1, new_v, removed_v, bb_all, bb_changed)
+        out2 = draw(img2, boxes2, new_v, removed_v, bb_all, bb_changed)
 
-        # ==========================================
         # DISPLAY
-        # ==========================================
         st.subheader("Results")
 
         col1, col2 = st.columns(2)
@@ -185,17 +236,15 @@ if uploaded_t1 and uploaded_t2:
         st.image(heatmap, caption="Change Map")
 
         st.metric("Changed Buildings", b_changed)
-        st.metric("Vehicle Change", v2 - v1)
+        st.metric("New Vehicles", len(new_v))
+        st.metric("Removed Vehicles", len(removed_v))
         st.metric("Threat Level", threat)
 
-        # ==========================================
-        # CSV DOWNLOAD
-        # ==========================================
+        # CSV
         df = pd.DataFrame([
-            {"metric": "total_buildings", "value": b_total},
             {"metric": "changed_buildings", "value": b_changed},
-            {"metric": "vehicles_t1", "value": v1},
-            {"metric": "vehicles_t2", "value": v2},
+            {"metric": "new_vehicles", "value": len(new_v)},
+            {"metric": "removed_vehicles", "value": len(removed_v)},
             {"metric": "threat_level", "value": threat}
         ])
 
